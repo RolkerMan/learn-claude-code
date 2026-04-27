@@ -27,11 +27,12 @@ forces it to keep updating when it forgets.
 Key insight: "The agent can track its own progress -- and I can see it."
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -40,7 +41,13 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+
+# client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    # 若没有配置环境变量，请用阿里云百炼API Key将下行替换为: api_key="sk-xxx",
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    base_url=os.getenv("ANTHROPIC_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
@@ -50,10 +57,24 @@ Prefer tools over prose."""
 
 # -- TodoManager: structured state the LLM writes to --
 class TodoManager:
-    def __init__(self):
-        self.items = []
+    """Manage a list of todo items for tracking task progress."""
+
+    def __init__(self) -> None:
+        """Initialize empty todo list."""
+        self.items: list[dict] = []
 
     def update(self, items: list) -> str:
+        """Update the todo list with new items.
+
+        Args:
+            items: List of todo item dictionaries.
+
+        Returns:
+            Rendered todo list string.
+
+        Raises:
+            ValueError: If validation fails.
+        """
         if len(items) > 20:
             raise ValueError("Max 20 todos allowed")
         validated = []
@@ -75,6 +96,11 @@ class TodoManager:
         return self.render()
 
     def render(self) -> str:
+        """Render the todo list as a formatted string.
+
+        Returns:
+            Formatted todo list string.
+        """
         if not self.items:
             return "No todos."
         lines = []
@@ -91,12 +117,32 @@ TODO = TodoManager()
 
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
+    """Resolve and validate a path is within the workspace.
+
+    Args:
+        p: Relative path to validate.
+
+    Returns:
+        Resolved absolute path.
+
+    Raises:
+        ValueError: If path escapes the workspace.
+    """
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
+    """Execute a bash command safely.
+
+    Args:
+        command: The shell command to execute.
+
+    Returns:
+        Command output or error message.
+    """
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -108,7 +154,17 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+
 def run_read(path: str, limit: int = None) -> str:
+    """Read file contents.
+
+    Args:
+        path: File path to read.
+        limit: Optional line limit.
+
+    Returns:
+        File contents or error message.
+    """
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -117,7 +173,17 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_write(path: str, content: str) -> str:
+    """Write content to a file.
+
+    Args:
+        path: File path to write.
+        content: Content to write.
+
+    Returns:
+        Success message or error.
+    """
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -126,7 +192,18 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace text in a file.
+
+    Args:
+        path: File path to edit.
+        old_text: Text to replace.
+        new_text: Replacement text.
+
+    Returns:
+        Success message or error.
+    """
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -147,53 +224,162 @@ TOOL_HANDLERS = {
 }
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
-     "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
+  {
+    "type": "function",
+    "function": {
+      "name": "bash",
+      "description": "Run a shell command.",
+      "parameters": {
+        "type": "object",
+        "properties": { "command": { "type": "string" } },
+        "required": ["command"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read file contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "limit": { "type": "integer" }
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_file",
+      "description": "Write content to file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit_file",
+      "description": "Replace exact text in file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "old_text": { "type": "string" },
+          "new_text": { "type": "string" }
+        },
+        "required": ["path", "old_text", "new_text"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "todo",
+      "description": "Update task list. Track progress on multi-step tasks.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "text": { "type": "string" },
+                "status": {
+                  "type": "string",
+                  "enum": ["pending", "in_progress", "completed"]
+                }
+              },
+              "required": ["id", "text", "status"]
+            }
+          }
+        },
+        "required": ["items"]
+      }
+    }
+  }
 ]
 
 
-# -- Agent loop with nag reminder injection --
-def agent_loop(messages: list):
+def agent_loop(messages: list) -> str:
+    """Run the agent loop with nag reminder injection.
+
+    Args:
+        messages: Conversation history list.
+
+    Returns:
+        Final text response from the assistant.
+    """
     rounds_since_todo = 0
     while True:
         # Nag reminder is injected below, alongside tool results
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            return
-        results = []
+        choice = response.choices[0]
+        assistant = choice.message
+        assistant_message = {
+            "role": "assistant",
+            "content": assistant.content or "",
+        }
+        if assistant.tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in assistant.tool_calls
+            ]
+        messages.append(assistant_message)
+        # If the model didn't call a tool, we're done
+        if not assistant.tool_calls:
+            return assistant.content or ""
+        # Execute each tool call, collect results
         used_todo = False
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
+        for tc in assistant.tool_calls:
+                handler = TOOL_HANDLERS.get(tc.function.name)
                 try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}:")
-                print(str(output)[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                if block.name == "todo":
+                    tool_input = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    tool_input = {}
+                output = handler(**tool_input) if handler else f"Unknown tool: {tc.function.name}"
+                print(output[:200])
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": output,
+                })
+                if tc.function.name == "todo":
                     used_todo = True
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
-            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
-        messages.append({"role": "user", "content": results})
+            messages.append({
+                "role": "user",
+                "content": "<reminder>Update your todos.</reminder>"
+            })
 
 
 if __name__ == "__main__":
-    history = []
+    history = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
             query = input("\033[36ms03 >> \033[0m")

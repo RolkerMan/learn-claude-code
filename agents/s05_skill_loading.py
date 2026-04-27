@@ -38,11 +38,12 @@ Key insight: "Don't put everything in the system prompt. Load on demand."
 import os
 import re
 import subprocess
+import json
 import yaml
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(override=True)
 
@@ -50,7 +51,10 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    base_url=os.getenv("ANTHROPIC_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 
@@ -184,28 +188,64 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
 ]
 
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": tool["name"],
+            "description": tool["description"],
+            "parameters": tool["input_schema"],
+        },
+    }
+    for tool in TOOLS
+]
 
-def agent_loop(messages: list):
+
+def agent_loop(messages: list) -> str:
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
+            tools=OPENAI_TOOLS,
+            max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}:")
-                print(str(output)[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        assistant = response.choices[0].message
+        assistant_message = {
+            "role": "assistant",
+            "content": assistant.content or "",
+        }
+        if assistant.tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                }
+                for tool_call in assistant.tool_calls
+            ]
+        messages.append(assistant_message)
+        if not assistant.tool_calls:
+            return assistant.content or ""
+        for tool_call in assistant.tool_calls:
+            handler = TOOL_HANDLERS.get(tool_call.function.name)
+            try:
+                tool_input = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                tool_input = {}
+            try:
+                output = handler(**tool_input) if handler else f"Unknown tool: {tool_call.function.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tool_call.function.name}:")
+            print(str(output)[:200])
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": str(output),
+            })
 
 
 if __name__ == "__main__":
@@ -218,10 +258,7 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        final_text = agent_loop(history)
+        if final_text:
+            print(final_text)
         print()

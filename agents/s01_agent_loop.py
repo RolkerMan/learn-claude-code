@@ -24,10 +24,10 @@ until the model decides to stop. Production agents layer
 policy, hooks, and lifecycle controls on top.
 """
 
+import json
 import os
 import subprocess
-import json
-import random
+
 try:
     import readline
     # #143 UTF-8 backspace fix for macOS libedit
@@ -73,6 +73,14 @@ TOOLS = [{
 
 
 def run_bash(command: str) -> str:
+    """Execute a bash command safely.
+
+    Args:
+        command: The shell command to execute.
+
+    Returns:
+        Command output or error message.
+    """
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -86,8 +94,15 @@ def run_bash(command: str) -> str:
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
-# -- The core pattern: a while loop that calls tools until the model stops --
-def agent_loop(messages: list):
+def agent_loop(messages: list) -> str:
+    """Run the agent loop, executing tools until the model stops.
+
+    Args:
+        messages: Conversation history list.
+
+    Returns:
+        Final text response from the assistant.
+    """
     while True:
         # response = client.messages.create(
         #     model=MODEL, system=SYSTEM, messages=messages,

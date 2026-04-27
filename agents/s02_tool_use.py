@@ -69,12 +69,34 @@ TOOLS = [{
 }]
 
 def safe_path(p: str) -> Path:
+    """Resolve and validate a path is within the workspace.
+
+    Args:
+        p: Relative path to validate.
+
+    Returns:
+        Resolved absolute path.
+
+    Raises:
+        ValueError: If path escapes the workspace.
+    """
     path = (WORKDIR / p).resolve()
+    print(f"Resolving path: {p} to {path}")
+    print(f"Checking if {path} is within {WORKDIR}")
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
+    """Execute a bash command safely.
+
+    Args:
+        command: The shell command to execute.
+
+    Returns:
+        Command output or error message.
+    """
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -88,7 +110,17 @@ def run_bash(command: str) -> str:
 
 
 def run_read(path: str, limit: int = None) -> str:
+    """Read file contents.
+
+    Args:
+        path: File path to read.
+        limit: Optional line limit.
+
+    Returns:
+        File contents or error message.
+    """
     try:
+        print(f"Reading file: {path} with limit: {limit}")
         text = safe_path(path).read_text()
         lines = text.splitlines()
         if limit and limit < len(lines):
@@ -99,6 +131,15 @@ def run_read(path: str, limit: int = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """Write content to a file.
+
+    Args:
+        path: File path to write.
+        content: Content to write.
+
+    Returns:
+        Success message or error.
+    """
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -109,6 +150,16 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace text in a file.
+
+    Args:
+        path: File path to edit.
+        old_text: Text to replace.
+        new_text: Replacement text.
+
+    Returns:
+        Success message or error.
+    """
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -189,8 +240,15 @@ TOOLS = [
   }
 ]
 
-# -- The core pattern: a while loop that calls tools until the model stops --
-def agent_loop(messages: list):
+def agent_loop(messages: list) -> str:
+    """Run the agent loop, executing tools until the model stops.
+
+    Args:
+        messages: Conversation history list.
+
+    Returns:
+        Final text response from the assistant.
+    """
     while True:
         response = client.chat.completions.create(
             model=MODEL,

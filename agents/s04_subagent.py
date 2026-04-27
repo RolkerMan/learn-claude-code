@@ -23,11 +23,12 @@ context, sharing the filesystem, then returns only a summary to the parent.
 Key insight: "Process isolation gives context isolation for free."
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -36,7 +37,13 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+
+# client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    # 若没有配置环境变量，请用阿里云百炼API Key将下行替换为: api_key="sk-xxx",
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    base_url=os.getenv("ANTHROPIC_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
@@ -103,73 +110,218 @@ TOOL_HANDLERS = {
 
 # Child gets all base tools except task (no recursive spawning)
 CHILD_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+  {
+    "type": "function",
+    "function": {
+      "name": "bash",
+      "description": "Run a shell command.",
+      "parameters": {
+        "type": "object",
+        "properties": { "command": { "type": "string" } },
+        "required": ["command"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read file contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "limit": { "type": "integer" }
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_file",
+      "description": "Write content to file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit_file",
+      "description": "Replace exact text in file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "old_text": { "type": "string" },
+          "new_text": { "type": "string" }
+        },
+        "required": ["path", "old_text", "new_text"]
+      }
+    }
+  }
 ]
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
 def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    # Start with a fresh context but include the subagent system prompt
+    sub_messages = [
+        {"role": "system", "content": SUBAGENT_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
     for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
+        # print sub_messages
+        # print("\033[32msubagent >>\033[0m", sub_messages[-1]["content"][:80])
+        response = client.chat.completions.create(
+            model=MODEL, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
-        sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        # print("called subagent:", response)
+        choice = response.choices[0]
+        assistant = choice.message
+        assistant_message = {
+            "role": "assistant",
+            "content": assistant.content or "",
+        }
+        if assistant.tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in assistant.tool_calls
+            ]
+        sub_messages.append(assistant_message)
+        if not assistant.tool_calls:
             break
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
+        for tc in assistant.tool_calls:
+            handler = TOOL_HANDLERS.get(tc.function.name)
+            try:
+                tool_input = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                tool_input = {}
+            output = handler(**tool_input) if handler else f"Unknown tool: {tc.function.name}"
+            results.append({"role": "tool", "tool_call_id": tc.id, "content": str(output)[:50000]})
+        # API expects message content to be text (or structured types with 'type').
+        # Serialize tool results to JSON so we don't pass a raw Python list.
+        sub_messages.append({"role": "user", "content": json.dumps(results)})
     # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+    print("return response")
+    return response;
+    # # Prefer the last assistant message from the subagent conversation.
+    # for msg in reversed(sub_messages):
+    #     if msg.get("role") == "assistant":
+    #         content = msg.get("content") or ""
+    #         if isinstance(content, str):
+    #             return content
+    #         # If the content is a structured list of chunks, try to join text fields
+    #         if isinstance(content, list):
+    #             try:
+    #                 return "".join(getattr(chunk, "text", str(chunk)) for chunk in content)
+    #             except Exception:
+    #                 return str(content)
+    #         return str(content)
+    # return "(no summary)"
 
 
 # -- Parent tools: base tools + task dispatcher --
 PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+  {
+    "type": "function",
+    "function": {
+      "name": "task",
+      "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prompt": { "type": "string" },
+          "description": {
+            "type": "string",
+            "description": "Short description of the task"
+          }
+        },
+        "required": ["prompt"]
+      }
+    }
+  }
 ]
 
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=PARENT_TOOLS,
+            max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            return
+        choice = response.choices[0]
+        assistant = choice.message
+        assistant_message = {
+            "role": "assistant",
+            "content": assistant.content or "",
+        }
+        if assistant.tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in assistant.tool_calls
+            ]
+        messages.append(assistant_message)
+        # If the model didn't call a tool, we're done
+        if not assistant.tool_calls:
+            return assistant.content or ""
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    prompt = block.input.get("prompt", "")
-                    print(f"> task ({desc}): {prompt[:80]}")
-                    output = run_subagent(prompt)
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        for tc in assistant.tool_calls:
+            if tc.function.name == "task":
+                try:
+                    tool_input = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    tool_input = {}
+                
+                desc = tool_input.get("description", "subtask")
+                prompt = tool_input.get("prompt", "")
+                print(f"> task ({desc}): {prompt[:80]}")
+                output = run_subagent(prompt)
+            else:
+                handler = TOOL_HANDLERS.get(tc.function.name)
+                try:
+                    tool_input = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    tool_input = {}
+                output = handler(**tool_input) if handler else f"Unknown tool: {tc.function.name}"
+                print(str(output)[:200])
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(output),
+                })
+        # Serialize tool results before appending to avoid passing raw lists
+        messages.append({"role": "user", "content": json.dumps(results)})
 
 
 if __name__ == "__main__":
-    history = []
+    history = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
             query = input("\033[36ms04 >> \033[0m")
@@ -178,7 +330,9 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
+        # print("before agent_loop, history:", history)
         agent_loop(history)
+        # print("agent_loop returned, history:", history)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:

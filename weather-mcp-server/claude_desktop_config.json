@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "weather": {
+      "command": "D:\\WorkSpace\\learn-claude-code\\weather-mcp-server\\venv\\Scripts\\python.exe",
+      "args": [
+        "D:\\WorkSpace\\learn-claude-code\\weather-mcp-server\\weather_server.py"
+      ]
+    }
+  }
+}
